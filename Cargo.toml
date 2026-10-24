@@ -1,10 +1,40 @@
 [package]
 name        = "shhoq"
-version     = "0.0.0"
+version     = "0.1.0"
 edition     = "2024"
 authors     = ["Romain SUZANNE <romzorus591@gmail.com>"]
 repository  = "https://github.com/romzorus/shhoq"
 license     = "Apache-2.0"
-description = "placeholder"
+description = "Rust client library for SSHOQ"
+keywords    = ["ssh", "quic", "http3", "ssh3", "sshoq"]
+categories  = ["network-programming"]
 
 [dependencies]
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+rustls-pki-types = "1"
+rustls-native-certs = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+tokio-util = "0.7"
+bytes = "1"
+futures-core = "0.3"
+qpack = { version = "0.1", default-features = false }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rsa = "0.9"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = { version = "0.10", features = ["oid"] }
+pem-rfc7468 = { version = "1", features = ["alloc"] }
+pkcs8 = "0.10"
+pkcs1 = "0.7"
+sec1 = "0.7"
+bcrypt-pbkdf = "0.11"
+aes = "0.9"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "process"] }
+tempfile = "3"
