@@ -1,3 +1,6 @@
+# Disclaimer
+This project must not be considered a real library. It is a vibe-coded proof of concept to create `shhoq` bindings for another Rust project. I will gladly give up the ownership of this project to the official `shhoq` community if they plan to support Rust bindings.
+
 # shhoq
 
 A Rust client library for [SSHOQ](https://github.com/h4sh5/sshoq) — an SSH2-like
