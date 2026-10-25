@@ -82,6 +82,13 @@ impl Client {
             .map_err(|e| Error::Protocol(format!("could not build the QUIC client config: {e}")))?;
         let mut transport = quinn::TransportConfig::default();
         transport.keep_alive_interval(Some(Duration::from_secs(1)));
+        // Bound the total connection attempt time (handshake + idle) to 10
+        // seconds, so a single unreachable address cannot stall the
+        // connection for quinn's 30-second default idle timeout.
+        transport.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(Duration::from_secs(10))
+                .expect("10 seconds fits in a QUIC varint"),
+        ));
         transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(MAX_INCOMING_BIDI_STREAMS));
         transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(MAX_INCOMING_UNI_STREAMS));
         let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
@@ -117,29 +124,7 @@ impl Client {
                 }
             }
         }
-        let conn = loop {
-            match set.join_next().await {
-                Some(Ok((addr, Ok(conn)))) => {
-                    tracing::debug!(%addr, "QUIC connection established");
-                    break conn;
-                }
-                Some(Ok((addr, Err(e)))) => {
-                    tracing::debug!(%addr, error = %e, "QUIC connection failed");
-                    last_err = Some(Error::Connection(e));
-                }
-                Some(Err(e)) => {
-                    last_err = Some(Error::Protocol(format!("connection task failed: {e}")));
-                }
-                None => {
-                    return Err(last_err.unwrap_or_else(|| {
-                        Error::Io(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("could not resolve {host_port}"),
-                        ))
-                    }));
-                }
-            }
-        };
+        let conn = wait_for_connection(&mut set, last_err, &host_port).await?;
 
         // The conversation ID is exported from the TLS keying material
         // (mirrors GenerateConversationID).
@@ -501,6 +486,78 @@ impl Client {
     }
 }
 
+/// One raced connection attempt: the address it targeted and the outcome of
+/// awaiting the QUIC handshake.
+type ConnectionAttempt = (
+    SocketAddr,
+    std::result::Result<quinn::Connection, quinn::ConnectionError>,
+);
+
+/// Wait for the first successful connection attempt in `set`.
+///
+/// A definitive error (e.g. a TLS certificate validation failure) aborts all
+/// remaining attempts and is returned immediately: retrying on another
+/// address cannot succeed. Non-definitive errors (e.g. a timeout on an
+/// unreachable address) are only remembered, and the remaining attempts keep
+/// running.
+async fn wait_for_connection(
+    set: &mut tokio::task::JoinSet<ConnectionAttempt>,
+    mut last_err: Option<Error>,
+    host_port: &str,
+) -> Result<quinn::Connection> {
+    loop {
+        match set.join_next().await {
+            Some(Ok((addr, Ok(conn)))) => {
+                tracing::debug!(%addr, "QUIC connection established");
+                return Ok(conn);
+            }
+            Some(Ok((addr, Err(e)))) => {
+                tracing::debug!(%addr, error = %e, "QUIC connection failed");
+                // A definitive error means retrying on another address cannot
+                // succeed: abort the remaining attempts and return now,
+                // instead of waiting for them to time out.
+                if is_definitive_connection_error(&e) {
+                    tracing::debug!(%addr, error = %e, "definitive connection error, aborting remaining attempts");
+                    set.abort_all();
+                    return Err(Error::Connection(e));
+                }
+                last_err = Some(Error::Connection(e));
+            }
+            Some(Err(e)) => {
+                last_err = Some(Error::Protocol(format!("connection task failed: {e}")));
+            }
+            None => {
+                return Err(last_err.unwrap_or_else(|| {
+                    Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("could not resolve {host_port}"),
+                    ))
+                }));
+            }
+        }
+    }
+}
+
+/// Returns true if the error is definitive — retrying on a different address
+/// cannot succeed (e.g. TLS certificate validation failure).
+fn is_definitive_connection_error(err: &quinn::ConnectionError) -> bool {
+    use quinn::ConnectionError;
+    match err {
+        // TLS/crypto errors have codes in the 0x100..0x200 range.
+        ConnectionError::TransportError(transport_err) => {
+            let code: u64 = transport_err.code.into();
+            (0x100..0x200).contains(&code)
+        }
+        ConnectionError::VersionMismatch
+        | ConnectionError::ConnectionClosed(_)
+        | ConnectionError::ApplicationClosed(_)
+        | ConnectionError::Reset => true,
+        ConnectionError::TimedOut
+        | ConnectionError::LocallyClosed
+        | ConnectionError::CidsExhausted => false,
+    }
+}
+
 /// Pipe one `agent-connection` channel to the local SSH agent socket (mirrors
 /// the Go client's `forwardAgent`).
 async fn forward_agent_connection(channel: Channel, socket_path: &Path) -> Result<()> {
@@ -542,4 +599,147 @@ async fn forward_agent_connection(channel: Channel, socket_path: &Path) -> Resul
     to_socket.abort();
     channel.close();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// A TLS/crypto handshake failure, as produced by a certificate
+    /// validation error (transport error codes in the 0x100..0x200 range).
+    fn crypto_connection_error(alert: u8) -> quinn::ConnectionError {
+        quinn::ConnectionError::TransportError(quinn::TransportErrorCode::crypto(alert).into())
+    }
+
+    #[test]
+    fn definitive_connection_error_classification() {
+        // TLS/crypto handshake failures are definitive.
+        assert!(is_definitive_connection_error(&crypto_connection_error(46)));
+        assert!(is_definitive_connection_error(&crypto_connection_error(0)));
+        // Other transport errors are not: another address may behave
+        // differently.
+        assert!(!is_definitive_connection_error(
+            &quinn::ConnectionError::TransportError(
+                quinn::TransportErrorCode::APPLICATION_ERROR.into()
+            )
+        ));
+        assert!(is_definitive_connection_error(
+            &quinn::ConnectionError::VersionMismatch
+        ));
+        assert!(is_definitive_connection_error(
+            &quinn::ConnectionError::ConnectionClosed(quinn::ConnectionClose {
+                error_code: quinn::TransportErrorCode::NO_ERROR,
+                frame_type: None,
+                reason: bytes::Bytes::new(),
+            })
+        ));
+        assert!(is_definitive_connection_error(
+            &quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(0),
+                reason: bytes::Bytes::new(),
+            })
+        ));
+        assert!(is_definitive_connection_error(
+            &quinn::ConnectionError::Reset
+        ));
+        // Timeouts and resource issues may succeed on another address.
+        assert!(!is_definitive_connection_error(
+            &quinn::ConnectionError::TimedOut
+        ));
+        assert!(!is_definitive_connection_error(
+            &quinn::ConnectionError::LocallyClosed
+        ));
+        assert!(!is_definitive_connection_error(
+            &quinn::ConnectionError::CidsExhausted
+        ));
+    }
+
+    #[tokio::test]
+    async fn definitive_error_aborts_hanging_attempts() {
+        let mut set: tokio::task::JoinSet<ConnectionAttempt> = tokio::task::JoinSet::new();
+        // One attempt fails immediately with a definitive error (e.g. the
+        // server's self-signed certificate is rejected)...
+        set.spawn(async move { (test_addr(4433), Err(crypto_connection_error(46))) });
+        // ...while another one hangs forever (e.g. IPv6 when the server only
+        // listens on IPv4).
+        set.spawn(async move { std::future::pending::<ConnectionAttempt>().await });
+
+        // The error must be returned immediately, not after the hanging
+        // attempt times out (30 seconds with quinn's default idle timeout).
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_connection(&mut set, None, "localhost:4433"),
+        )
+        .await
+        .expect("a definitive error must abort the hanging attempts");
+        match result {
+            Err(Error::Connection(quinn::ConnectionError::TransportError(e))) => {
+                let code: u64 = e.code.into();
+                assert!((0x100..0x200).contains(&code));
+            }
+            other => panic!("expected a crypto transport error, got {other:?}"),
+        }
+        // The hanging attempt was aborted.
+        match set.join_next().await {
+            Some(Err(e)) => assert!(e.is_cancelled()),
+            other => panic!("expected the hanging attempt to be aborted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_definitive_error_waits_for_other_attempts() {
+        let mut set: tokio::task::JoinSet<ConnectionAttempt> = tokio::task::JoinSet::new();
+        // One attempt fails immediately with a non-definitive error (a
+        // timeout on an unreachable address)...
+        set.spawn(async move { (test_addr(4433), Err(quinn::ConnectionError::TimedOut)) });
+        // ...and another one fails later with a definitive error.
+        set.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            (test_addr(4434), Err(quinn::ConnectionError::Reset))
+        });
+
+        // The loop must keep waiting for the second attempt: the error
+        // returned is the second attempt's, not the first attempt's timeout.
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_connection(&mut set, None, "localhost:4433"),
+        )
+        .await
+        .expect("the loop must wait for the remaining attempts");
+        assert!(start.elapsed() >= Duration::from_millis(100));
+        match result {
+            Err(Error::Connection(quinn::ConnectionError::Reset)) => {}
+            other => panic!("expected the second attempt's error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn all_attempts_failing_returns_an_error() {
+        let mut set: tokio::task::JoinSet<ConnectionAttempt> = tokio::task::JoinSet::new();
+        set.spawn(async move { (test_addr(4433), Err(quinn::ConnectionError::TimedOut)) });
+        set.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            (test_addr(4434), Err(quinn::ConnectionError::TimedOut))
+        });
+        let result = wait_for_connection(&mut set, None, "localhost:4433").await;
+        assert!(matches!(
+            result,
+            Err(Error::Connection(quinn::ConnectionError::TimedOut))
+        ));
+    }
+
+    #[tokio::test]
+    async fn empty_set_returns_the_previous_error() {
+        // When no connection could even be initiated (the errors collected
+        // while spawning), that error is returned as-is.
+        let mut set: tokio::task::JoinSet<ConnectionAttempt> = tokio::task::JoinSet::new();
+        let result =
+            wait_for_connection(&mut set, Some(Error::Unauthorized), "localhost:4433").await;
+        assert!(matches!(result, Err(Error::Unauthorized)));
+    }
 }
